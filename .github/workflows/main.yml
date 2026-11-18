@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # perlu untuk membuat GitHub Release
+  contents: write
 
 concurrency:
   group: build-apk-${{ github.ref }}
@@ -15,26 +15,122 @@ concurrency:
 jobs:
   apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       VERSION_CODE: ${{ github.run_number }}
-      CI: "true"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cek file wajib
+      - name: Rapikan struktur proyek (otomatis)
         run: |
-          # Jaga-jaga: index.html terunggah di luar folder www
-          if [ ! -f www/index.html ] && [ -f index.html ]; then
-            mkdir -p www && mv index.html www/index.html
-            echo "index.html dipindah ke www/"
+          set -e
+          echo "== Isi repo =="; find . -path ./.git -prune -o -type f -print | sort | head -80
+
+          # --- index.html -> www/index.html
+          if [ ! -f www/index.html ]; then
+            F=$(find . -name index.html -not -path './node_modules/*' -not -path './android/*' -not -path './.git/*' | head -1)
+            [ -n "$F" ] || { echo "::error::index.html tidak ditemukan di repo. Unggah www/index.html"; exit 1; }
+            mkdir -p www && cp "$F" www/index.html
           fi
-          echo "Isi repo:"; find . -path ./.git -prune -o -type f -print | head -50
-          for f in package.json capacitor.config.json www/index.html patch-android.py \
-                   salasatu.keystore native/MainActivity.java native/PrinterBridgePlugin.java; do
-            [ -f "$f" ] || { echo "::error::File wajib tidak ada: $f"; exit 1; }
+
+          # --- file Java -> native/
+          mkdir -p native
+          for J in MainActivity.java PrinterBridgePlugin.java; do
+            if [ ! -f "native/$J" ]; then
+              F=$(find . -name "$J" -not -path './node_modules/*' -not -path './android/*' -not -path './.git/*' | head -1)
+              [ -n "$F" ] || { echo "::error::$J tidak ditemukan di repo. Unggah file ini."; exit 1; }
+              cp "$F" "native/$J"
+            fi
           done
+
+          # --- package.json
+          if [ ! -f package.json ]; then
+            echo "package.json tidak ada, dibuat otomatis"
+            cat > package.json <<'JSON'
+          {
+            "name": "salasatu-kasir",
+            "version": "1.2.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "6.2.0",
+              "@capacitor/cli": "6.2.0",
+              "@capacitor/core": "6.2.0",
+              "@capacitor/filesystem": "^6.0.0",
+              "@capacitor/share": "^6.0.0",
+              "jspdf": "2.5.1",
+              "jspdf-autotable": "3.8.2"
+            }
+          }
+          JSON
+          fi
+
+          # --- capacitor.config.json
+          if [ ! -f capacitor.config.json ]; then
+            echo "capacitor.config.json tidak ada, dibuat otomatis"
+            cat > capacitor.config.json <<'JSON'
+          {
+            "appId": "id.salasatucoffee.kasir",
+            "appName": "Salasatu Kasir",
+            "webDir": "www",
+            "android": { "backgroundColor": "#1E1511" }
+          }
+          JSON
+          fi
+
+          # --- keystore tetap (kalau tidak ada, buat baru)
+          if [ ! -f salasatu.keystore ]; then
+            echo "::warning::salasatu.keystore tidak ada di repo, dibuat baru. APK ini TIDAK bisa menimpa APK lama yang tandatangannya beda. Unggah keystore lama Anda agar update tidak menghapus data."
+            keytool -genkeypair -keystore salasatu.keystore -storetype PKCS12 \
+              -storepass salasatu123 -keypass salasatu123 -alias salasatu \
+              -keyalg RSA -keysize 2048 -validity 36500 \
+              -dname "CN=Salasatu Kasir, O=Salasatu Coffee, C=ID"
+          fi
+
+          # --- skrip patch (selalu pakai versi ini agar konsisten)
+          cat > ci_patch_android.py <<'PY'
+          import re, shutil, os, sys
+          pkg = 'id/salasatucoffee/kasir'
+          dst = 'android/app/src/main/java/' + pkg
+          os.makedirs(dst, exist_ok=True)
+          for f in ('PrinterBridgePlugin.java', 'MainActivity.java'):
+              shutil.copy('native/' + f, dst + '/' + f)
+
+          m = 'android/app/src/main/AndroidManifest.xml'
+          s = open(m).read()
+          perms = ['BLUETOOTH', 'BLUETOOTH_ADMIN', 'BLUETOOTH_CONNECT', 'BLUETOOTH_SCAN']
+          add = ''.join('    <uses-permission android:name="android.permission.%s" />\n' % p
+                        for p in perms if 'android.permission.%s"' % p not in s)
+          if 'android.hardware.usb.host' not in s:
+              add += '    <uses-feature android:name="android.hardware.usb.host" android:required="false" />\n'
+          if 'android.hardware.bluetooth"' not in s:
+              add += '    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />\n'
+          s = s.replace('<application', add + '    <application', 1)
+          open(m, 'w').write(s)
+
+          v = 'android/variables.gradle'
+          t = open(v).read()
+          t = re.sub(r'targetSdkVersion\s*=\s*\d+', 'targetSdkVersion = 30', t)
+          open(v, 'w').write(t)
+
+          g = 'android/app/build.gradle'
+          b = open(g).read()
+          sign = """    signingConfigs {
+                  debug {
+                      storeFile file('../../salasatu.keystore')
+                      storePassword 'salasatu123'
+                      keyAlias 'salasatu'
+                      keyPassword 'salasatu123'
+                  }
+              }
+          """
+          b, n = re.subn(r'(\nandroid \{\n)', lambda mm: mm.group(1) + sign, b, count=1)
+          if n != 1:
+              sys.exit('gagal menyisipkan signingConfigs')
+          b = re.sub(r'versionCode \d+', 'versionCode ' + os.environ.get('VERSION_CODE', '1'), b, count=1)
+          open(g, 'w').write(b)
+          print('patch OK')
+          PY
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -57,19 +153,18 @@ jobs:
         run: |
           cp node_modules/jspdf/dist/jspdf.umd.min.js www/
           cp node_modules/jspdf-autotable/dist/jspdf.plugin.autotable.min.js www/
-          ls -l www
 
       - name: Tambah platform Android
         run: |
           rm -rf android
           npx cap add android
 
-      - name: Patch proyek Android (plugin printer, izin, signing)
+      - name: Patch proyek Android
         run: |
-          python3 patch-android.py
-          grep -q "signingConfigs" android/app/build.gradle || { echo "::error::Patch signing gagal"; exit 1; }
-          grep -q "BLUETOOTH_CONNECT" android/app/src/main/AndroidManifest.xml || { echo "::error::Patch manifest gagal"; exit 1; }
-          grep -q "targetSdkVersion = 30" android/variables.gradle || { echo "::error::Patch targetSdk gagal"; exit 1; }
+          python3 ci_patch_android.py
+          grep -q "signingConfigs" android/app/build.gradle
+          grep -q "BLUETOOTH_CONNECT" android/app/src/main/AndroidManifest.xml
+          grep -q "targetSdkVersion = 30" android/variables.gradle
 
       - name: Sinkron Capacitor
         run: npx cap sync android
@@ -77,13 +172,13 @@ jobs:
       - name: Terima lisensi Android SDK
         run: yes | "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
-      - name: Build APK (debug, ditandatangani keystore tetap)
+      - name: Build APK
         working-directory: android
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon --stacktrace
 
-      - name: Siapkan & verifikasi APK
+      - name: Siapkan dan verifikasi APK
         run: |
           APK=android/app/build/outputs/apk/debug/app-debug.apk
           [ -f "$APK" ] || { echo "::error::APK tidak ditemukan"; exit 1; }
