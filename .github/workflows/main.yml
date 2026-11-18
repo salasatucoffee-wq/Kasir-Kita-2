@@ -25,6 +25,12 @@ jobs:
 
       - name: Cek file wajib
         run: |
+          # Jaga-jaga: index.html terunggah di luar folder www
+          if [ ! -f www/index.html ] && [ -f index.html ]; then
+            mkdir -p www && mv index.html www/index.html
+            echo "index.html dipindah ke www/"
+          fi
+          echo "Isi repo:"; find . -path ./.git -prune -o -type f -print | head -50
           for f in package.json capacitor.config.json www/index.html patch-android.py \
                    salasatu.keystore native/MainActivity.java native/PrinterBridgePlugin.java; do
             [ -f "$f" ] || { echo "::error::File wajib tidak ada: $f"; exit 1; }
